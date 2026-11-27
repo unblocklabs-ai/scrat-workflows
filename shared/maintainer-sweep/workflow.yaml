@@ -40,14 +40,36 @@ config:
   maxMergedPrs: 60
   minLinkedIssues: 2
   maxIssueBodyChars: 1200
+  d1ExtractMaxItems: 24
+  d1ExtractConcurrency: 4
+  d1ExtractMinConfidence: 0.55
+  d1ExtractMaxStateChars: 8000
   maxPrBodyChars: 800
   maxProposedHistory: 50
   ledgerBackfillDays: 60
   ledgerMaxEntries: 120
   ledgerBatchSize: 20
+  ledgerParallelBatches: 3
+  ledgerHunkConcurrency: 3
   ledgerSummaryMaxChars: 360
+  ledgerSummaryMinChars: 10
+  ledgerMaxAreas: 5
   ledgerMaxFilesPerPr: 12
   ledgerGitLogLimit: 300
+  ledgerGitMaxBufferBytes: 8388608
+  ledgerMaxHunksPerPr: 2
+  ledgerCandidateHunksPerPr: 8
+  ledgerMaxHunkChars: 700
+  ledgerD1MinScore: 0.35
+  d1MaxClusters: 16
+  d1ClusterMinScore: 0.45
+  d1MaxClusterItems: 8
+  d1ClusterItemMaxChars: 360
+  maxDuplicateChecks: 2
+  rfcMinSlugChars: 2
+  rfcMaxSlugChars: 61
+  rfcMinTitleChars: 5
+  rfcMinBodyChars: 10
   ledger:
     provider: codex-lb
     model: gpt-6.1-terra

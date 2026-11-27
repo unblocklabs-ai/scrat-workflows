@@ -18,8 +18,8 @@ For each PR in the input `prs` array, produce **one** structured ledger entry th
    - For `bugfix`: state **what broke**, **which module/invariant caused it**, and **whether the fix looks like a local patch or a root-cause fix**.
    - For `feature` / `refactor`: state **what capability or boundary changed** and **which subsystems it coupled or simplified**.
    - For `chore`: 1 short sentence is enough.
-   - Ground your summary in `files` (actual paths touched in git) alongside `title`, `labels`, and `body`. Do **not** waste time reading large files unless a PR title and body are completely opaque and reading 1 short file clarifies it.
-4. **Keep `areas` tight (1–4 short subsystem/module tags)** such as `auth`, `billing`, `migrations`, `webhooks`, `cart`, `checkout`, `sync`, `workflow-runtime`.
+   - Ground your summary in `hunks` (actual first-parent changes) and cross-check them against `files` and `body`. If no hunks are available, use `files`, `title`, `labels`, and `body`. Read local files only when the supplied evidence is unclear.
+4. **Keep `areas` tight**: use short subsystem tags such as `auth`, `billing`, or `workflow-runtime`, up to `maxAreas`.
 
 ## Output
 
