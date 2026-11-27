@@ -1,5 +1,8 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type { WorkflowContext } from "scrat";
+
+const execFileAsync = promisify(execFile);
 
 type OpenIssue = Awaited<ReturnType<WorkflowContext["github"]["listOpenItems"]>>["issues"][number];
 type D1 = WorkflowContext["d1"];
@@ -12,6 +15,8 @@ type ModelOverride = { provider?: string; model?: string; thinkingLevel?: Thinki
 type LedgerKind = "bugfix" | "feature" | "refactor" | "chore";
 type Hunk = { path: string; snippet: string };
 type PrGitContext = { sha: string; files: string[] };
+type GitConfig = { maxBuffer: number; timeout: number; contextLines: number; excludedDiffPaths: string[] };
+type HunkConfig = { maxHunks: number; candidateHunks: number; maxChars: number; maxStateChars: number; minScore: number; timeoutMs: number };
 type LedgerEntry = {
   number: number;
   title: string;
@@ -132,11 +137,6 @@ type ProposedRfc = { slug: string; title: string; issueNumber?: number; proposed
 const str = (value: unknown, fallback = "") => typeof value === "string" ? value : fallback;
 const strList = (value: unknown, fallback: string[]) => Array.isArray(value) && value.every((v) => typeof v === "string") ? value : fallback;
 const labelOf = (label: string | { name?: string | null }) => typeof label === "string" ? label : (label.name ?? "");
-const excludedDiffPaths = [
-  "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb",
-  "Cargo.lock", "composer.lock", "Gemfile.lock", "poetry.lock", "uv.lock", "*.min.*", "*.generated.*",
-  "dist/**", "generated/**", "__generated__/**",
-].map((pattern) => `:(exclude,glob,icase)**/${pattern}`);
 const trimText = (text: string | null | undefined, max: number) => {
   const clean = (text ?? "").trim();
   if (clean.length <= max) return clean;
@@ -155,41 +155,59 @@ function readModelOverride(raw: unknown): ModelOverride {
   return out;
 }
 
-async function inWaves<T, R>(ctx: WorkflowContext, items: readonly T[], width: number, run: (item: T) => Promise<R>): Promise<R[]> {
+async function inWaves<T, R>(
+  ctx: WorkflowContext, items: readonly T[], width: number, run: (item: T) => Promise<R>, onWave?: (completed: R[]) => void,
+): Promise<R[]> {
   const result: R[] = [];
   for (let i = 0; i < items.length; i += width) {
     const wave = Object.fromEntries(items.slice(i, i + width).map((item, index) => [index, () => run(item)]));
-    result.push(...Object.values(await ctx.parallel(wave)));
+    const completed = Object.values(await ctx.parallel(wave));
+    onWave?.(completed);
+    result.push(...completed);
   }
   return result;
 }
 
 function confidentStrings(answer: Extraction | undefined, minimum: number): string[] {
-  if (!Array.isArray(answer?.value) || (answer.confidence !== undefined && !(answer.confidence >= minimum))) return [];
+  const confident = (value: unknown) => value === undefined || (typeof value === "number" && value >= minimum);
+  if (!Array.isArray(answer?.value) || !confident(answer.confidence)
+    || (typeof answer.p_null === "number" && answer.p_null > 1 - minimum)) return [];
   const values: unknown[] = answer.value;
   return [...new Set(values.flatMap((value, i) => {
-    const confidence = answer.confidences?.[i];
-    if (typeof value !== "string" || (confidence !== undefined && !(confidence >= minimum))) return [];
+    if (typeof value !== "string" || !confident(answer.confidences?.[i])) return [];
     const clean = value.trim();
     return clean ? [clean] : [];
   }))];
 }
 
-function tryGit(cwd: string, maxBuffer: number, args: string[]) {
+async function tryGit(
+  ctx: WorkflowContext, cwd: string, cfg: GitConfig, args: string[], fallbackArgs?: string[],
+): Promise<string> {
+  const { maxBuffer, timeout } = cfg;
   if (!maxBuffer) return "";
   try {
-    return execFileSync("git", ["-c", "core.quotePath=false", ...args], { cwd, encoding: "utf8", maxBuffer, stdio: ["ignore", "pipe", "pipe"] });
-  } catch {
-    return "";
+    const { stdout } = await execFileAsync("git", ["-c", "core.quotePath=false", ...args], {
+      cwd, encoding: "utf8", maxBuffer, timeout, signal: ctx.signal,
+    });
+    return stdout;
+  } catch (error) {
+    if (ctx.signal.aborted) throw error;
+    if (!error || typeof error !== "object") return "";
+    if (fallbackArgs && "stderr" in error && typeof error.stderr === "string" && error.stderr.includes("--diff-merges")) {
+      return tryGit(ctx, cwd, cfg, fallbackArgs);
+    }
+    return "stdout" in error && typeof error.stdout === "string" ? error.stdout : "";
   }
 }
 
-function mapPrGitContext(cwd: string, baseSha: string, commitLimit: number, maxFilesPerPr: number, maxBuffer: number): Map<number, PrGitContext> {
+async function mapPrGitContext(
+  ctx: WorkflowContext, cwd: string, baseSha: string, commitLimit: number, maxFilesPerPr: number, cfg: GitConfig,
+): Promise<Map<number, PrGitContext>> {
   const result = new Map<number, PrGitContext>();
   if (!commitLimit) return result;
-  const stdout = tryGit(cwd, maxBuffer, ["log", "--first-parent", "-n", String(commitLimit), "--format=@@@%H%x09%s", "--name-only", baseSha, "--"]);
+  const stdout = await tryGit(ctx, cwd, cfg, ["log", "--first-parent", "-n", String(commitLimit), "--format=@@@%H%x09%s", "--name-only", baseSha, "--"]);
   let current: PrGitContext | undefined;
-  for (const rawLine of stdout.split("\n")) {
+  for (const rawLine of stdout.slice(0, stdout.lastIndexOf("\n") + 1).split("\n")) {
     if (!rawLine) continue;
     const header = rawLine.match(/^@@@([a-f0-9]+)\t(.*)$/);
     if (header) {
@@ -210,12 +228,14 @@ function mapPrGitContext(cwd: string, baseSha: string, commitLimit: number, maxF
   return result;
 }
 
-function readPrHunks(cwd: string, sha: string, limit: number, maxChars: number, maxBuffer: number): Hunk[] {
+async function readPrHunks(ctx: WorkflowContext, cwd: string, sha: string, limit: number, maxChars: number, cfg: GitConfig): Promise<Hunk[]> {
   if (!limit || !maxChars) return [];
-  const stdout = tryGit(cwd, maxBuffer, [
-    "show", "--first-parent", "--unified=1", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames",
-    "--src-prefix=a/", "--dst-prefix=b/", "--format=", sha, "--", ...excludedDiffPaths,
-  ]);
+  const args = [
+    "--first-parent", `--unified=${cfg.contextLines}`, "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames",
+    "--src-prefix=a/", "--dst-prefix=b/", "--format=", sha, "--",
+    ...cfg.excludedDiffPaths.map((pattern) => `:(exclude,glob,icase)**/${pattern}`),
+  ];
+  const stdout = await tryGit(ctx, cwd, cfg, ["show", "--diff-merges=first-parent", ...args], ["show", "-m", ...args]);
   const hunks: Hunk[] = [];
   let path = "";
   let lines: string[] = [];
@@ -242,23 +262,33 @@ function readPrHunks(cwd: string, sha: string, limit: number, maxChars: number, 
 }
 
 async function selectPrHunks(
-  d1: D1 | undefined, cwd: string, sha: string, pr: { title: string; body: string },
-  cfg: { maxHunks: number; candidateHunks: number; maxChars: number; minScore: number }, maxBuffer: number,
+  ctx: WorkflowContext, d1: D1 | undefined, cwd: string, sha: string, pr: { title: string; body: string },
+  cfg: HunkConfig, gitConfig: GitConfig,
 ): Promise<Hunk[]> {
   if (!cfg.maxHunks) return [];
-  const canScore = d1 && cfg.candidateHunks > 0;
+  const canScore = d1 && cfg.candidateHunks > 0 && cfg.maxStateChars > 0;
   const limit = canScore ? Math.max(cfg.maxHunks + 1, cfg.candidateHunks) : cfg.maxHunks;
-  const hunks = readPrHunks(cwd, sha, limit, cfg.maxChars, maxBuffer);
+  const hunks = await readPrHunks(ctx, cwd, sha, limit, cfg.maxChars, gitConfig);
   if (canScore && hunks.length > cfg.maxHunks) {
-    const candidates = hunks.slice(0, cfg.candidateHunks).map((hunk, index) => ({ id: `hunk_${index}`, ...hunk }));
+    const candidates = new Map<number, Hunk & { id: string }>();
+    let state = "";
+    for (const [index, hunk] of hunks.slice(0, cfg.candidateHunks).entries()) {
+      const candidate = { id: `hunk_${index}`, ...hunk };
+      const nextState = JSON.stringify({ title: pr.title, body: pr.body, hunks: [...candidates.values(), candidate] });
+      if (nextState.length >= cfg.maxStateChars) continue;
+      candidates.set(index, candidate);
+      state = nextState;
+    }
+    if (!state) return hunks.slice(0, cfg.maxHunks);
     const result = await d1.score({
-      state: JSON.stringify({ title: pr.title, body: pr.body, hunks: candidates }),
-      questions: Object.fromEntries(candidates.map(({ id }) => [
+      state,
+      timeoutMs: cfg.timeoutMs,
+      questions: Object.fromEntries([...candidates.values()].map(({ id }) => [
         id, `Does ${id} show the core behavioral change, bug fix, or invariant boundary?`,
       ])),
     });
     if (result.ok) {
-      const ranked = candidates.flatMap(({ id }, index) => {
+      const ranked = [...candidates].flatMap(([index, { id }]) => {
         const score = result.scores[id];
         return Number.isFinite(score) && score >= cfg.minScore ? [{ index, score }] : [];
       }).sort((a, b) => b.score - a.score || a.index - b.index);
@@ -269,14 +299,28 @@ async function selectPrHunks(
   return hunks.slice(0, cfg.maxHunks);
 }
 
-function explicitReferences(text: string): string[] {
-  return [...text.matchAll(/#(\d+)\b/g)].map(([, number]) => `#${number}`);
+function explicitReferences(text: string, maxKnownNumber: number): string[] {
+  return [...text.matchAll(/(?<![\w&#])#(\d{1,7})\b/g)].flatMap(([, number]) =>
+    number.startsWith("0") || Number(number) > maxKnownNumber ? [] : [`#${number}`]);
 }
 
-function seedClusters(issues: SweepIssue[], ledger: LedgerEntry[], maxClusters: number, maxItems: number, detailChars: number) {
+function issuePaths(text: string) {
+  const pathText = text.replace(/https?:\/\/[^\s<>"`]+/gi, "");
+  const paths = pathText.match(/(?<![\w.@+/-])(?:\/?(?:[\w.@+-]+\/)+\.?[\w@+-]+(?:\.[\w@+-]+)*|[\w@+-]*(?:\.[\w@+-]+)+)/g) ?? [];
+  return paths.flatMap((path) => {
+    const file = /\.[a-z][\w+-]*$/i.test(path);
+    const parts = path.split("/").filter((part) => part && part !== "." && part !== "..");
+    const directory = parts.length >= 3 || (parts.length === 2 && (/^[./]/.test(path) || /[.@_+\d-]/.test(parts.join(""))));
+    return file || directory ? [{ path: parts.join("/"), file }] : [];
+  });
+}
+
+function seedClusters(
+  issues: SweepIssue[], ledger: LedgerEntry[], maxKnownNumber: number, maxClusters: number, maxItems: number, detailChars: number,
+) {
   const groups = new Map<string, Set<number>>();
   const items = new Map<number, { kind: LedgerKind | "issue"; title: string; detail: string }>();
-  const index = (number: number, areas: string[], paths: string[], refs: string[]) => {
+  const index = (number: number, areas: string[], paths: { path: string; file: boolean }[], refs: string[]) => {
     const add = (key: string) => {
       const group = groups.get(key) ?? new Set<number>();
       group.add(number);
@@ -286,9 +330,10 @@ function seedClusters(issues: SweepIssue[], ledger: LedgerEntry[], maxClusters: 
       const key = area.toLowerCase().trim().replace(/^(?:area|scope|component)[:/\s]+/, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
       if (key && !/^(?:bug|bugfix|enhancement|feature|question|chore|refactor|documentation|duplicate|invalid|help-wanted|good-first-issue|wontfix)$/.test(key)) add(`area:${key}`);
     }
-    for (const path of paths) {
-      const parts = path.replace(/^\.?\//, "").split("/").filter(Boolean);
-      for (let length = 1; length <= parts.length; length++) add(`path:${parts.slice(0, length).join("/")}`);
+    for (const { path, file } of paths) {
+      const parts = path.split("/").filter(Boolean);
+      if (file && parts.length) add(`file:${parts.join("/")}`);
+      for (let length = 2; length <= parts.length - Number(file); length++) add(`path:${parts.slice(0, length).join("/")}`);
     }
     for (const ref of [`#${number}`, ...refs]) add(`ref:${ref}`);
   };
@@ -296,32 +341,32 @@ function seedClusters(issues: SweepIssue[], ledger: LedgerEntry[], maxClusters: 
   for (const issue of issues) {
     const { number, title, body, labels, extracted } = issue;
     const issueText = `${title}\n${body}`;
-    const pathText = [issueText, ...(extracted?.symbols ?? [])].join("\n").replace(/https?:\/\/[^\s<>"`]+/gi, "");
-    const paths = [
-      ...(pathText.match(/(?:[\w.@+-]+\/)+[\w.@+-]+/g) ?? []),
-      ...(extracted?.symbols ?? []).filter((symbol) => /^[\w@+-]+\.[a-z]\w*$/i.test(symbol)),
-    ];
-    const refs = (extracted?.linkedIssues ?? []).flatMap((ref) => /^\d+$/.test(ref) ? [`#${ref}`] : explicitReferences(ref));
+    const paths = issuePaths([issueText, ...(extracted?.symbols ?? [])].join("\n"));
+    const refs = (extracted?.linkedIssues ?? []).flatMap((ref) => explicitReferences(/^\d+$/.test(ref) ? `#${ref}` : ref, maxKnownNumber));
     items.set(number, {
       kind: "issue",
       title,
       detail: trimText([...(extracted?.errors ?? []), ...(extracted?.symbols ?? []), ...refs, body].join("\n"), detailChars),
     });
-    index(number, labels, paths, [...refs, ...explicitReferences(issueText)]);
+    index(number, labels, paths, [...refs, ...explicitReferences(issueText, maxKnownNumber)]);
   }
   for (const { number, title, kind, areas, files, summary, linkedIssues } of ledger) {
     items.set(number, { kind, title, detail: trimText(summary, detailChars) });
-    index(number, areas, files, [...(linkedIssues ?? []), ...explicitReferences(`${title}\n${summary}`)]);
+    const paths = files.map((path) => ({ path, file: true }));
+    const refs = explicitReferences([title, summary, ...(linkedIssues ?? [])].join("\n"), maxKnownNumber);
+    index(number, areas, paths, refs);
   }
   const isBugfix = (number: number) => Number(items.get(number)?.kind === "bugfix");
+  const specificity = (group: string) => group.startsWith("ref:") ? 3 : group.startsWith("file:") ? 2 : group.startsWith("area:") ? 1 : 0;
   const seen = new Set<string>();
   const clusters: CandidateCluster[] = [];
   const seeds = [...groups].flatMap(([group, members]) => {
-    if (members.size < 2) return [];
+    if (members.size < 2 || members.size > maxItems * 2) return [];
     const numbers = [...members];
     const bugfixes = numbers.reduce((sum, number) => sum + isBugfix(number), 0);
     return [{ group, numbers, bugfixes }];
-  }).sort((a, b) => b.numbers.length - a.numbers.length || b.bugfixes - a.bugfixes || a.group.localeCompare(b.group));
+  }).sort((a, b) => specificity(b.group) - specificity(a.group) || a.numbers.length - b.numbers.length
+    || b.bugfixes - a.bugfixes || a.group.localeCompare(b.group));
   for (const { group, numbers } of seeds) {
     const itemNumbers = numbers.sort((a, b) => isBugfix(b) - isBugfix(a) || b - a).slice(0, maxItems).sort((a, b) => a - b);
     const key = itemNumbers.join(",");
@@ -358,6 +403,7 @@ export default async function maintainerSweep(ctx: WorkflowContext) {
   const maxIssueBodyChars = count("maxIssueBodyChars");
   const maxPrBodyChars = count("maxPrBodyChars");
   const maxProposedHistory = count("maxProposedHistory");
+  const d1TimeoutMs = count("d1TimeoutMs", 8000);
   const extractConfig = {
     maxItems: count("d1ExtractMaxItems", 24),
     concurrency: count("d1ExtractConcurrency", 4),
@@ -372,18 +418,27 @@ export default async function maintainerSweep(ctx: WorkflowContext) {
   const ledgerMaxAreas = count("ledgerMaxAreas", 5);
   const ledgerMaxFilesPerPr = count("ledgerMaxFilesPerPr", 12);
   const ledgerGitLogLimit = count("ledgerGitLogLimit", 300);
-  const ledgerGitMaxBufferBytes = count("ledgerGitMaxBufferBytes", 8 * 1024 * 1024);
+  const gitConfig: GitConfig = {
+    maxBuffer: count("ledgerMaxBufferBytes", 8 * 1024 * 1024),
+    timeout: count("ledgerGitTimeoutMs", 5000),
+    contextLines: count("ledgerDiffContextLines", 1),
+    excludedDiffPaths: strList(cfg.ledgerExcludedDiffPaths, []),
+  };
   const ledgerParallelBatches = Math.max(1, count("ledgerParallelBatches", 3));
   const hunkConfig = {
     maxHunks: count("ledgerMaxHunksPerPr", 2),
     candidateHunks: count("ledgerCandidateHunksPerPr", 8),
     maxChars: count("ledgerMaxHunkChars", 700),
+    maxStateChars: count("ledgerHunkMaxStateChars", 10000),
     concurrency: Math.max(1, count("ledgerHunkConcurrency", 3)),
     minScore: num("ledgerD1MinScore", 0.35),
+    timeoutMs: d1TimeoutMs,
   };
   const clusterConfig = {
     maxClusters: count("d1MaxClusters", 16),
     maxItems: count("d1MaxClusterItems", 8),
+    maxStateChars: count("d1ClusterMaxStateChars", 10000),
+    concurrency: Math.max(1, count("d1ClusterConcurrency", 4)),
     minScore: num("d1ClusterMinScore", 0.45),
     detailChars: count("d1ClusterItemMaxChars", 360),
   };
@@ -399,13 +454,14 @@ export default async function maintainerSweep(ctx: WorkflowContext) {
   const rfcMarker = `<!-- scrat-fingerprint:workflow:${ctx.workflow.name}:`;
   const isRfc = (issue: OpenIssue) => issue.labels.some((label) => rfcLabels.has(labelOf(label).toLowerCase())) || (issue.body ?? "").includes(rfcMarker);
 
+  const existingLedger = ctx.state.get<LedgerEntry[]>("mergedLedger") ?? [];
+  const backfillPending = ctx.state.get<boolean>("mergedLedgerBackfillPending");
+  const lookbackDays = existingLedger.length && !backfillPending ? recentMergedDays : Math.max(recentMergedDays, ledgerBackfillDays);
   const gathered = await ctx.step("gather", {
     maxOpenIssues, maxOpenPrs, recentMergedDays, ledgerBackfillDays, maxMergedPrs, maxIssueBodyChars, maxPrBodyChars, issueLabels,
-    extractConfig, d1Enabled: !!d1,
+    lookbackDays, extractConfig, d1TimeoutMs, d1Enabled: !!d1,
   }, async () => {
     const previouslyProposed = ctx.state.get<ProposedRfc[]>("proposed") ?? [];
-    const existingLedger = ctx.state.get<LedgerEntry[]>("mergedLedger") ?? [];
-    const lookbackDays = existingLedger.length > 0 ? recentMergedDays : Math.max(recentMergedDays, ledgerBackfillDays);
     const { open, merged } = await ctx.parallel({
       open: () => ctx.github.listOpenItems(),
       merged: () => ctx.github.listRecentMergedPrs(lookbackDays, maxMergedPrs),
@@ -419,6 +475,7 @@ export default async function maintainerSweep(ctx: WorkflowContext) {
       await inWaves(ctx, eligible, extractConfig.concurrency, async (issue) => {
         const result = await d1.extract({
           state: (issue.body ?? "").slice(0, extractConfig.maxStateChars),
+          timeoutMs: d1TimeoutMs,
           fields: {
             linked_issues: { type: "list", items: "text", instructions: "Explicit issue or PR numbers referenced (e.g. #123)." },
             error_messages: { type: "list", items: "text", instructions: "Exact error names, codes, or failure messages mentioned." },
@@ -436,7 +493,6 @@ export default async function maintainerSweep(ctx: WorkflowContext) {
     }
     return {
       previouslyProposed,
-      existingLedger,
       backlog: {
         openIssues: issues.map((issue) => ({
           number: issue.number,
@@ -463,7 +519,9 @@ export default async function maintainerSweep(ctx: WorkflowContext) {
       },
     };
   });
-  const { backlog, previouslyProposed, existingLedger } = gathered;
+  const { backlog, previouslyProposed } = gathered;
+  const maxKnownNumber = [...backlog.openIssues, ...backlog.openPrs, ...backlog.recentMergedPrs, ...existingLedger]
+    .reduce((max, { number }) => Math.max(max, number), 0);
 
   return ctx.workspace.withCheckout(ctx.workspace.baseBranch, async (ws) => {
     const ledgerResult = await ctx.step("update_ledger", {
@@ -479,64 +537,90 @@ export default async function maintainerSweep(ctx: WorkflowContext) {
       ledgerMaxAreas,
       ledgerMaxFilesPerPr,
       ledgerGitLogLimit,
-      ledgerGitMaxBufferBytes,
+      gitConfig,
       hunkConfig,
+      maxKnownNumber,
+      lookbackDays,
       d1Enabled: !!d1,
     }, async () => {
-      const byNumber = new Map<number, LedgerEntry>();
-      for (const entry of existingLedger) byNumber.set(entry.number, entry);
-      const unseen = backlog.recentMergedPrs.filter((pr) => !byNumber.has(pr.number));
+      const seen = new Set(existingLedger.map(({ number }) => number));
+      const unseen = backlog.recentMergedPrs.filter((pr) => !seen.has(pr.number));
       if (!unseen.length) {
+        if (backfillPending) ctx.state.delete("mergedLedgerBackfillPending");
         return { added: 0, total: existingLedger.length, entries: existingLedger };
       }
-      const gitByPr = mapPrGitContext(ws.path, ws.baseSha, ledgerGitLogLimit, ledgerMaxFilesPerPr, ledgerGitMaxBufferBytes);
+      if (lookbackDays > recentMergedDays && !backfillPending) ctx.state.set("mergedLedgerBackfillPending", true);
+      const gitByPr = await mapPrGitContext(ctx, ws.path, ws.baseSha, ledgerGitLogLimit, ledgerMaxFilesPerPr, gitConfig);
       const chunks: typeof unseen[] = [];
       for (let i = 0; i < unseen.length; i += ledgerBatchSize) {
         chunks.push(unseen.slice(i, i + ledgerBatchSize));
       }
-      const batches = await inWaves(ctx, chunks, ledgerParallelBatches, async (batch) => {
-        const chunk = await inWaves(ctx, batch, hunkConfig.concurrency, async (pr) => {
-          const git = gitByPr.get(pr.number);
-          const hunks = git ? await selectPrHunks(d1, ws.path, git.sha, pr, hunkConfig, ledgerGitMaxBufferBytes) : [];
-          return { ...pr, files: git?.files ?? [], hunks };
-        });
-        const res = await ctx.agent.run<LedgerBatchResult>({
-          cwd: ws.path,
-          skill: "LEDGER.md",
-          ...ledgerModel,
-          codemode: false,
-          tools: ["read", "ls"],
-          input: { maxSummaryChars: ledgerSummaryMaxChars, maxAreas: ledgerMaxAreas, prs: chunk },
-          submitResult: {
-            schema: ledgerSchema(ledgerMaxAreas, ledgerSummaryMinChars),
-            description: "Submit one compact root-cause ledger entry for each PR in prs.",
-          },
-        });
-        if (res.outcome !== "complete") throw new Error(`Ledger summarizer did not complete (outcome: ${res.outcome})`);
-        const returned = new Map((res.data?.entries ?? []).map((entry) => [entry.number, entry]));
-        return chunk.map((pr): LedgerEntry => {
-          const item = returned.get(pr.number);
-          const linkedIssues = [...new Set(explicitReferences(`${pr.title}\n${pr.body}`))];
-          return {
-            number: pr.number,
-            title: pr.title,
-            mergedAt: pr.mergedAt,
-            kind: item?.kind ?? "feature",
-            areas: (item?.areas ?? []).map((a) => a.trim()).filter(Boolean).slice(0, ledgerMaxAreas),
-            files: pr.files,
-            hunks: pr.hunks,
-            ...(linkedIssues.length ? { linkedIssues } : {}),
-            summary: trimText(item?.summary || pr.title, ledgerSummaryMaxChars),
-          };
+      let mergedEntries = existingLedger;
+      const batches = await inWaves(ctx, chunks, ledgerParallelBatches, async (batch): Promise<LedgerEntry[]> => {
+        const numbers = batch.map(({ number }) => number);
+        try {
+          const chunk = await inWaves(ctx, batch, hunkConfig.concurrency, async (pr) => {
+            const git = gitByPr.get(pr.number);
+            const hunks = git ? await selectPrHunks(ctx, d1, ws.path, git.sha, pr, hunkConfig, gitConfig) : [];
+            return { ...pr, files: git?.files ?? [], hunks };
+          });
+          const res = await ctx.agent.run<LedgerBatchResult>({
+            cwd: ws.path,
+            skill: "LEDGER.md",
+            ...ledgerModel,
+            codemode: false,
+            tools: ["read", "ls"],
+            input: { maxSummaryChars: ledgerSummaryMaxChars, maxAreas: ledgerMaxAreas, prs: chunk },
+            submitResult: {
+              schema: ledgerSchema(ledgerMaxAreas, ledgerSummaryMinChars),
+              description: "Submit one compact root-cause ledger entry for each PR in prs.",
+            },
+          });
+          const outcome = res.outcome === "complete" ? res.data?.status ?? res.outcome : res.outcome;
+          if (outcome !== "complete") {
+            ctx.log.warn({ event: "maintainer-sweep.ledger_batch_incomplete", outcome, numbers });
+            return [];
+          }
+          const returned = new Map((res.data?.entries ?? []).map((entry) => [entry.number, entry]));
+          const omitted = numbers.filter((number) => !returned.has(number));
+          if (omitted.length) ctx.log.warn({ event: "maintainer-sweep.ledger_batch_omitted", numbers: omitted });
+          return chunk.flatMap((pr): LedgerEntry[] => {
+            const item = returned.get(pr.number);
+            if (!item) return [];
+            const linkedIssues = [...new Set(explicitReferences(`${pr.title}\n${pr.body}`, maxKnownNumber))];
+            return [{
+              number: pr.number,
+              title: pr.title,
+              mergedAt: pr.mergedAt,
+              kind: item.kind,
+              areas: item.areas.map((area) => area.trim()).filter(Boolean).slice(0, ledgerMaxAreas),
+              files: pr.files,
+              hunks: pr.hunks,
+              ...(linkedIssues.length ? { linkedIssues } : {}),
+              summary: trimText(item.summary, ledgerSummaryMaxChars),
+            }];
+          });
+        } catch (error) {
+          if (ctx.signal.aborted) throw error;
+          ctx.log.warn({ event: "maintainer-sweep.ledger_batch_failed", numbers, err: error });
+          return [];
+        }
+      }, (wave) => {
+        const additions = wave.flat();
+        if (!additions.length) return;
+        mergedEntries = ctx.state.update<LedgerEntry[]>("mergedLedger", (current = []) => {
+          const byNumber = new Map(current.map((entry) => [entry.number, entry]));
+          for (const entry of additions) byNumber.set(entry.number, entry);
+          return [...byNumber.values()]
+            .sort((a, b) => b.mergedAt.localeCompare(a.mergedAt) || b.number - a.number)
+            .slice(0, ledgerMaxEntries);
         });
       });
-      const addedEntries = batches.flat();
-      for (const entry of addedEntries) byNumber.set(entry.number, entry);
-      const mergedEntries = [...byNumber.values()]
-        .sort((a, b) => b.mergedAt.localeCompare(a.mergedAt) || b.number - a.number)
-        .slice(0, ledgerMaxEntries);
-      ctx.state.set("mergedLedger", mergedEntries);
-      return { added: addedEntries.length, total: mergedEntries.length, entries: mergedEntries };
+      const added = batches.reduce((sum, batch) => sum + batch.length, 0);
+      if (added === unseen.length && (backfillPending || lookbackDays > recentMergedDays)) {
+        ctx.state.delete("mergedLedgerBackfillPending");
+      }
+      return { added, total: mergedEntries.length, entries: mergedEntries };
     });
 
     const signalLedger = ledgerResult.entries.filter((entry) => entry.kind !== "chore");
@@ -550,26 +634,27 @@ export default async function maintainerSweep(ctx: WorkflowContext) {
     }
 
     const { clusters } = await ctx.step("rank_candidates", {
-      baseSha: ws.baseSha, d1Enabled: !!d1, clusterConfig, openIssues: backlog.openIssues, mergedLedger: signalLedger,
+      baseSha: ws.baseSha, d1Enabled: !!d1, d1TimeoutMs, clusterConfig, maxKnownNumber, openIssues: backlog.openIssues, mergedLedger: signalLedger,
     }, async () => {
       const { clusters, items } = seedClusters(
-        backlog.openIssues, signalLedger, clusterConfig.maxClusters, clusterConfig.maxItems, clusterConfig.detailChars,
+        backlog.openIssues, signalLedger, maxKnownNumber, clusterConfig.maxClusters, clusterConfig.maxItems, clusterConfig.detailChars,
       );
       if (!d1 || !clusters.length) return { clusters, d1Used: false };
-      const keyed = clusters.map((cluster, index) => ({ id: `cluster_${index}`, ...cluster }));
-      const numbers = new Set(keyed.flatMap(({ itemNumbers }) => itemNumbers));
-      const result = await d1.score({
-        state: JSON.stringify({
-          clusters: keyed,
-          items: Object.fromEntries([...numbers].map((number) => [number, items.get(number)])),
-        }),
-        questions: Object.fromEntries(keyed.map(({ id }) => [
-          id, `Do the items in ${id} stem from one shared failing invariant or missing primitive in the codebase (not merely touching the same broad folder), and does the root cause still appear unresolved?`,
-        ])),
-      });
-      if (!result.ok) return { clusters, d1Used: false };
-      const scored = clusters.map((cluster, index): CandidateCluster => {
-        const d1Score = result.scores[keyed[index].id];
+      const scored = await inWaves(ctx, clusters, clusterConfig.concurrency, async (cluster): Promise<CandidateCluster> => {
+        const state = JSON.stringify({
+          cluster,
+          items: Object.fromEntries(cluster.itemNumbers.map((number) => [number, items.get(number)])),
+        });
+        if (state.length >= clusterConfig.maxStateChars) return cluster;
+        const result = await d1.score({
+          state,
+          timeoutMs: d1TimeoutMs,
+          questions: {
+            shared_cause: "Do the items stem from one shared failing invariant or missing primitive in the codebase (not merely touching the same broad folder), and does the root cause still appear unresolved?",
+          },
+        });
+        if (!result.ok) return cluster;
+        const d1Score = result.scores.shared_cause;
         return Number.isFinite(d1Score) ? { ...cluster, d1Score, meetsD1Threshold: d1Score >= clusterConfig.minScore } : cluster;
       });
       scored.sort((a, b) => Number(!!b.meetsD1Threshold) - Number(!!a.meetsD1Threshold) || (b.d1Score ?? -Infinity) - (a.d1Score ?? -Infinity));
@@ -581,7 +666,7 @@ export default async function maintainerSweep(ctx: WorkflowContext) {
       candidateClusters: clusters,
       openIssues: backlog.openIssues,
       openPrs: backlog.openPrs,
-      mergedLedger: ledgerResult.entries,
+      mergedLedger: signalLedger,
       minLinkedIssues,
       maxDuplicateChecks,
       previouslyProposed,

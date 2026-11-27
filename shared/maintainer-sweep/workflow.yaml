@@ -40,6 +40,7 @@ config:
   maxMergedPrs: 60
   minLinkedIssues: 2
   maxIssueBodyChars: 1200
+  d1TimeoutMs: 8000
   d1ExtractMaxItems: 24
   d1ExtractConcurrency: 4
   d1ExtractMinConfidence: 0.55
@@ -56,15 +57,37 @@ config:
   ledgerMaxAreas: 5
   ledgerMaxFilesPerPr: 12
   ledgerGitLogLimit: 300
-  ledgerGitMaxBufferBytes: 8388608
+  ledgerGitTimeoutMs: 5000
+  ledgerDiffContextLines: 1
+  ledgerMaxBufferBytes: 8388608
+  ledgerExcludedDiffPaths:
+    - package-lock.json
+    - npm-shrinkwrap.json
+    - pnpm-lock.yaml
+    - yarn.lock
+    - bun.lock
+    - bun.lockb
+    - Cargo.lock
+    - composer.lock
+    - Gemfile.lock
+    - poetry.lock
+    - uv.lock
+    - "*.min.*"
+    - "*.generated.*"
+    - dist/**
+    - generated/**
+    - __generated__/**
   ledgerMaxHunksPerPr: 2
   ledgerCandidateHunksPerPr: 8
   ledgerMaxHunkChars: 700
+  ledgerHunkMaxStateChars: 10000
   ledgerD1MinScore: 0.35
   d1MaxClusters: 16
   d1ClusterMinScore: 0.45
   d1MaxClusterItems: 8
   d1ClusterItemMaxChars: 360
+  d1ClusterMaxStateChars: 10000
+  d1ClusterConcurrency: 4
   maxDuplicateChecks: 2
   rfcMinSlugChars: 2
   rfcMaxSlugChars: 61
