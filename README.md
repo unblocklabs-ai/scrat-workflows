@@ -1,6 +1,6 @@
 # scrat-workflows
 
-Private workflow bundles and per-client overlays for UnblockLabs Scrat VMs (`scrat`, `worker-pearl`, `worker-theo`).
+Shared workflow bundles and per-client overlays for UnblockLabs Scrat VMs (`scrat`, `worker-pearl`, `worker-theo`).
 
 ## Layout
 
