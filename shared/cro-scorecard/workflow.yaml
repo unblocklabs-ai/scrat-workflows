@@ -39,7 +39,7 @@ config:
     - /
   lighthouseRuns: 2
   # Budget per Lighthouse batch (live and preview each get their own). 0 = no timeout.
-  lighthouseTimeoutSeconds: 600
+  lighthouseTimeoutSeconds: 1800
   # true: wait silently for a run where the preview is ready.
   # false: comment on the PR explaining why the preview can't be scored yet.
   skipIfNoPreview: true

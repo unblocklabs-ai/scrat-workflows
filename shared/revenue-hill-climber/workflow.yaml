@@ -42,7 +42,7 @@ config:
     - /
   lighthouseRuns: 2
   # Shared budget for the whole Lighthouse batch. 0 = no timeout.
-  lighthouseTimeoutSeconds: 600
+  lighthouseTimeoutSeconds: 1800
   # Skip the run when no device produced a scored Lighthouse group.
   requireBaseline: true
   # Insight culprit items kept per insight (0 = all) and characters per item (0 = untrimmed).
