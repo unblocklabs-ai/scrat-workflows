@@ -1,0 +1,70 @@
+name: cro-scorecard
+description: After review_pr finishes on a cro-experiment PR, measures Lighthouse 13 on the live theme vs. the PR's Shopify preview theme and posts a before/after scorecard (scores, Core Web Vitals, insights, agentic browsing) to the PR and Slack for thumb-testing.
+enabled: false
+priority: 5
+on:
+  event:
+    source: workflow
+    kind: workflow_completed
+    workflow: review_pr
+  manual: true
+permissions:
+  github:
+    - read
+    - comment
+  slack:
+    - post
+  workspace:
+    - read
+defaults:
+  # No agent runs here; Scrat requires model defaults on every workflow.
+  provider: codex-lb
+  model: gpt-6.2-sol
+  thinkingLevel: low
+  retry:
+    initialDelaySeconds: 60
+    maxDelaySeconds: 3600
+  tools:
+    - read
+config:
+  # Slack channel for the thumb-test card. Empty = GitHub comment only.
+  channel: ""
+  # Post the Slack card when channel is set.
+  announceChannel: true
+  # PRs (or the issues they close) carrying this label, or a valid experiment marker, are scored.
+  croLabel: cro-experiment
+  # Fallback when neither the linked issue nor the PR carries valid experiment metadata.
+  # Canonical storefront paths; Shopify preview controls (preview_theme_id, preview_key, _ab, _fd, _sc) are rejected.
+  targetPages:
+    - /
+  lighthouseRuns: 2
+  # Budget per Lighthouse batch (live and preview each get their own). 0 = no timeout.
+  lighthouseTimeoutSeconds: 600
+  # true: wait silently for a run where the preview is ready.
+  # false: comment on the PR explaining why the preview can't be scored yet.
+  skipIfNoPreview: true
+  # Require the review_pr event's reviewed head, the PR's current head and the preview
+  # theme's synced head to all agree. Checked before measuring and again before publishing.
+  requireFreshPreview: true
+  # review_pr completion gates (event triggers only; manual runs skip them). Empty list = no gate.
+  # outcome: complete | incomplete | needs_decision
+  passingReviewOutcomes:
+    - complete
+  # grade: S | A | B | C | D | F (address_review handles C/D/F, so S/A/B pass)
+  passingGrades:
+    - S
+    - A
+    - B
+  # publication: published | not_needed | pending
+  passingPublications:
+    - published
+  # When no (page, device) pair scored on both Live and Preview, post an "incomplete"
+  # comment (no Slack, nothing recorded) so the next review_pr completion retries.
+  commentOnIncomplete: true
+  # An insight counts as resolved only when the preview explicitly scores it at or above this.
+  insightPassScore: 0.9
+  # Insight rows shown per device in the PR comment. 0 = all. Upstream detail is already
+  # capped by Scrat's storefront.lighthouse.insights settings.
+  maxInsightRows: 0
+  # Scored PR heads remembered for dedupe. 0 = unlimited.
+  maxScoredHeads: 500

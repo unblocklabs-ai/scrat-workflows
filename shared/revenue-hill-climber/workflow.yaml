@@ -1,0 +1,81 @@
+name: revenue-hill-climber
+description: Twice-weekly storefront conversion and performance hill-climber. Measures live Lighthouse 13 baselines, hunts for source-verified CRO and deletion experiments, has an adversarial critic pick at most one surgical winner, and opens an implementation-ready issue for Scrat's implement -> review_pr pipeline. GitHub only; cro-scorecard owns Slack once a preview exists.
+enabled: false
+priority: 5
+on:
+  cron: "0 14 * * 1,4"
+  window: "72h"
+  manual: true
+permissions:
+  github:
+    - read
+    - issue
+  workspace:
+    - read
+defaults:
+  provider: codex-lb
+  model: gpt-6.2-sol
+  thinkingLevel: high
+  retry:
+    initialDelaySeconds: 60
+    maxDelaySeconds: 3600
+  tools:
+    - read
+    - grep
+    - find
+    - ls
+    - git
+    - browser
+config:
+  # Label applied to experiment issues; also used to count open experiments.
+  croLabel: cro-experiment
+  # When true, also label the issue with ctx.bot.slug so Scrat's implement ->
+  # review_pr -> address_review pipeline builds the PR and live Shopify preview.
+  autoImplement: true
+  # Open issues + open PRs carrying croLabel (or the experiment marker). 0 = unlimited.
+  # Checked at the start of the run and again, live, right before the issue is created.
+  maxOpenExperiments: 1
+  # Storefront paths to measure and hunt on. Override per client (home, collection, flagship PDP).
+  # Candidates may only target a subset of these. Shopify preview controls
+  # (preview_theme_id, preview_key, _ab, _fd, _sc) are rejected.
+  targetPages:
+    - /
+  lighthouseRuns: 2
+  # Shared budget for the whole Lighthouse batch. 0 = no timeout.
+  lighthouseTimeoutSeconds: 600
+  # Skip the run when no device produced a scored Lighthouse group.
+  requireBaseline: true
+  # Insight culprit items kept per insight (0 = all) and characters per item (0 = untrimmed).
+  # Scrat's storefront.lighthouse.insights settings cap the upstream detail first.
+  maxInsightItems: 5
+  maxInsightItemChars: 400
+  # Browser budget per agent session (Scrat requires positive integers).
+  browserSteps: 160
+  browserSeconds: 1800
+  # Candidate count bounds for the hunt. maxCandidates 0 = unlimited.
+  # minCandidates is enforced after invalid and ledger-duplicate candidates are dropped.
+  minCandidates: 3
+  maxCandidates: 5
+  # At least one valid candidate must be subtractive (remove blocking scripts, dead widgets, clutter).
+  requireDeletionCandidate: true
+  # git ls-tree verification of candidate files at the base commit.
+  gitTimeoutMs: 10000
+  gitMaxBufferBytes: 8388608
+  # d1 pre-screen. A candidate is filtered only when all four d1 scores come back and
+  # their mean is below d1MinScore (0 = keep all); partial, failed, or timed-out scoring
+  # passes the candidate to the critic unscored. d1TimeoutMs 0 = Scrat's d1 default.
+  # d1BudgetMs is a shared deadline across all d1 waves (0 = none). d1MaxStateChars 0 = no limit.
+  d1MinScore: 0.5
+  d1TimeoutMs: 8000
+  d1BudgetMs: 60000
+  d1Concurrency: 3
+  d1MaxStateChars: 12000
+  # Rolling experiment ledger stored in workflow state. 0 = unlimited.
+  maxLedgerEntries: 60
+  # Always appended to the winner's acceptance criteria.
+  mandatoryAcceptanceCriteria:
+    - "Purchase path is unbroken: add to cart, cart drawer/page, and checkout handoff work on mobile and desktop."
+    - "Before/after is verified on the live Shopify preview theme for every target page (cro-scorecard posts the Lighthouse comparison)."
+    - "The change is reversible in a single revert and does not touch checkout, payment, or discount logic."
+  # Optional critic model override, e.g. { provider: codex-lb, model: gpt-6.2-sol, thinkingLevel: xhigh }.
+  critique: {}
